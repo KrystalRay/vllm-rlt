@@ -35,14 +35,23 @@ class AscendEagerAttention:
             planned.append((rows[0], indices, positions, mask, initial))
         return planned
 
-    def _forward(self, q, keys, values, tables, groups):
+    def _forward(self, q, keys, values, tables, groups, *, layer=None):
         result = torch.zeros_like(q)
-        block_size = keys.shape[1]
-        head_groups = q.shape[1] // keys.shape[2]
+        block_size, kv_heads, head_dim = keys.shape[-3:]
+        head_groups = q.shape[1] // kv_heads
+        if layer is not None:
+            num_layers = keys.shape[1]
+            keys = keys.view(-1, kv_heads, head_dim)
+            values = values.view_as(keys)
         for first, indices, positions, mask, initial in groups:
             blocks = tables[first, positions // block_size]
             offsets = positions % block_size
-            k, v = keys[blocks, offsets], values[blocks, offsets]
+            if layer is None:
+                k, v = keys[blocks, offsets], values[blocks, offsets]
+            else:
+                # Flatten the contiguous [block, layer, offset] axes of the pool.
+                slots = (blocks.to(torch.int64) * num_layers + layer) * block_size + offsets
+                k, v = keys.index_select(0, slots), values.index_select(0, slots)
             if head_groups != 1:
                 k = k.repeat_interleave(head_groups, dim=1)
                 v = v.repeat_interleave(head_groups, dim=1)
@@ -65,7 +74,7 @@ class AscendEagerAttention:
         groups = self._plan([tuple(row) for row in tables.tolist()], lengths.tolist(), q.device)
         return self._forward(q, keys, values, tables, groups)
 
-    def attend_metadata(self, q, keys, values, batch):
+    def attend_metadata(self, q, keys, values, batch, *, layer=None):
         if self._metadata is None or self._metadata() is not batch:
             self._groups = self._plan(
                 [(id(allocation), depth) for allocation, depth, _ in batch.rows],
@@ -73,4 +82,4 @@ class AscendEagerAttention:
                 q.device,
             )
             self._metadata = weakref.ref(batch)
-        return self._forward(q, keys, values, batch.block_tables, self._groups)
+        return self._forward(q, keys, values, batch.block_tables, self._groups, layer=layer)

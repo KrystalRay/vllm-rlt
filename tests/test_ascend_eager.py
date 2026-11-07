@@ -31,6 +31,35 @@ def test_eager_groups_match_independent_causal_queries(kv_heads):
 
 
 @pytest.mark.npu
+@torch.inference_mode()
+def test_pooled_kv_reads_match_layer_views_across_pages_and_depths():
+    from vllm_rlt.core.kv_cache_manager import KVCacheManager
+    from vllm_rlt.device import resolve_device
+
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    torch.manual_seed(99)
+    cache = KVCacheManager(
+        3, 2, 64, 16, 16, 2, device=device, dtype=torch.bfloat16, backend="ascend_eager"
+    )
+    assert cache.allocate("a", 17)
+    assert cache.allocate("b", 3)
+    batch = cache._prepare_batch(["a"] * 17 + ["b"] * 3, [0] * 17 + [1] * 3, [*range(17), 0, 1, 2])
+    for layer in range(3):
+        k = torch.randn(20, 2, 64, device=device, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        cache._write_prepared(layer, batch, k, v)
+
+    q = torch.randn(20, 4, 64, device=device, dtype=torch.bfloat16)
+    for layer in range(3):
+        expected = cache.attention.attend_metadata(
+            q, cache.key_cache[:, layer], cache.value_cache[:, layer], batch
+        )
+        actual = cache._attend_prepared(layer, batch, q)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.npu
 @pytest.mark.parametrize("chunk_size", [4096, 128])
 @torch.inference_mode()
 def test_engine_matches_the_same_manual_prefill_chunks(chunk_size):

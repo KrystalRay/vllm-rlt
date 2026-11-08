@@ -755,10 +755,6 @@ class KVCacheManager:
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
             )
-        if self.device.type == "npu" and self.backend == "ascend_eager":
-            return self.attention.kernel.attend_metadata(
-                q, self.key_cache, self.value_cache, batch, layer=layer
-            )
         return self.attention.attend_metadata(
             q, self.key_cache[:, layer], self.value_cache[:, layer], batch
         )

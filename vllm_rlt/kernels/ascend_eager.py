@@ -7,6 +7,31 @@ import weakref
 import torch
 
 
+def _flat_kv_rows(keys, values):
+    blocks, block_size, heads, head_dim = keys.shape
+    block_stride, *row_strides = keys.stride()
+    row_width = heads * head_dim
+    if (
+        not blocks
+        or not row_width
+        or values.shape != keys.shape
+        or values.stride() != keys.stride()
+        or tuple(row_strides) != (row_width, head_dim, 1)
+        or block_stride < block_size * row_width
+        or block_stride % row_width
+    ):
+        return None
+    rows_per_block = block_stride // row_width
+    # The view starts at this layer's storage offset. Include the gaps between
+    # its pages, then gather only rows belonging to the selected layer.
+    shape = ((blocks - 1) * rows_per_block + block_size, heads, head_dim)
+    return (
+        keys.as_strided(shape, row_strides),
+        values.as_strided(shape, row_strides),
+        rows_per_block,
+    )
+
+
 class AscendEagerAttention:
     """Batch each request/depth's queries; borrow only validated host metadata."""
 
@@ -35,23 +60,19 @@ class AscendEagerAttention:
             planned.append((rows[0], indices, positions, mask, initial))
         return planned
 
-    def _forward(self, q, keys, values, tables, groups, *, layer=None):
+    def _forward(self, q, keys, values, tables, groups, *, flat_rows=None):
         result = torch.zeros_like(q)
         block_size, kv_heads, head_dim = keys.shape[-3:]
         head_groups = q.shape[1] // kv_heads
-        if layer is not None:
-            num_layers = keys.shape[1]
-            keys = keys.view(-1, kv_heads, head_dim)
-            values = values.view_as(keys)
         for first, indices, positions, mask, initial in groups:
             blocks = tables[first, positions // block_size]
             offsets = positions % block_size
-            if layer is None:
+            if flat_rows is None:
                 k, v = keys[blocks, offsets], values[blocks, offsets]
             else:
-                # Flatten the contiguous [block, layer, offset] axes of the pool.
-                slots = (blocks.to(torch.int64) * num_layers + layer) * block_size + offsets
-                k, v = keys.index_select(0, slots), values.index_select(0, slots)
+                flat_keys, flat_values, rows_per_block = flat_rows
+                slots = blocks.to(torch.int64) * rows_per_block + offsets
+                k, v = flat_keys.index_select(0, slots), flat_values.index_select(0, slots)
             if head_groups != 1:
                 k = k.repeat_interleave(head_groups, dim=1)
                 v = v.repeat_interleave(head_groups, dim=1)
@@ -74,7 +95,7 @@ class AscendEagerAttention:
         groups = self._plan([tuple(row) for row in tables.tolist()], lengths.tolist(), q.device)
         return self._forward(q, keys, values, tables, groups)
 
-    def attend_metadata(self, q, keys, values, batch, *, layer=None):
+    def attend_metadata(self, q, keys, values, batch):
         if self._metadata is None or self._metadata() is not batch:
             self._groups = self._plan(
                 [(id(allocation), depth) for allocation, depth, _ in batch.rows],
@@ -82,4 +103,6 @@ class AscendEagerAttention:
                 q.device,
             )
             self._metadata = weakref.ref(batch)
-        return self._forward(q, keys, values, batch.block_tables, self._groups, layer=layer)
+        return self._forward(
+            q, keys, values, batch.block_tables, self._groups, flat_rows=_flat_kv_rows(keys, values)
+        )

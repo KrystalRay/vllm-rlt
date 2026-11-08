@@ -52,8 +52,12 @@ def test_pooled_kv_reads_match_layer_views_across_pages_and_depths():
 
     q = torch.randn(20, 4, 64, device=device, dtype=torch.bfloat16)
     for layer in range(3):
-        expected = cache.attention.attend_metadata(
-            q, cache.key_cache[:, layer], cache.value_cache[:, layer], batch
+        expected = cache.attention(
+            q,
+            cache.key_cache[:, layer],
+            cache.value_cache[:, layer],
+            batch.block_tables,
+            batch.context_lengths,
         )
         actual = cache._attend_prepared(layer, batch, q)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)

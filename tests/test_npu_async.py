@@ -171,7 +171,7 @@ def test_npu_cancel_reuse_rejects_late_coda_and_eos_stops():
 
 @pytest.mark.npu
 def test_npu_batched_greedy_preserves_ties_and_padding():
-    from vllm_rlt.worker.sampler import Sampler
+    from vllm_rlt.worker.ascend import AscendSampler
 
     device = resolve_device("npu:0")
     logits = torch.zeros((3, 49152), dtype=torch.bfloat16)
@@ -182,7 +182,7 @@ def test_npu_batched_greedy_preserves_ties_and_padding():
     logits[2, 0] = 9
     logits = logits.to(device)
     params = (SamplingParams(), SamplingParams())
-    actual = Sampler().sample_batch(logits, params, (None, None))
+    actual = AscendSampler().sample_batch(logits, params, (None, None))
     expected = torch.stack([row.argmax() for row in logits[:2]])
     assert actual.cpu().tolist() == [1, 0]
     assert torch.equal(actual, expected)
@@ -193,7 +193,7 @@ def test_npu_batched_greedy_preserves_ties_and_padding():
 def test_npu_hidden_gather_keeps_cross_stream_sources_alive():
     from types import SimpleNamespace
 
-    from vllm_rlt.worker.model_runner import ModelRunner
+    from vllm_rlt.worker.ascend import AscendModelRunner
 
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
@@ -219,11 +219,14 @@ def test_npu_hidden_gather_keeps_cross_stream_sources_alive():
         gate.record(blocker)
     consumer.wait_event(gate)
     runner = SimpleNamespace(
-        hidden_batch=None, device_ops=torch.npu, execution_config=SimpleNamespace(multi_stream=True)
+        hidden_batch=None,
+        device=device,
+        device_ops=torch.npu,
+        execution_config=SimpleNamespace(multi_stream=True),
     )
     try:
         with torch.npu.stream(consumer):
-            actual = ModelRunner._gather(runner, [request], None, 1)
+            actual = AscendModelRunner._gather(runner, [request], None, 1)
         request.hidden_state = None
         del source
         poisoned = []

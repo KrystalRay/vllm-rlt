@@ -1,6 +1,5 @@
 """Owned batch state and completion events preserve request lifetimes."""
 
-import gc
 from contextlib import nullcontext
 
 import pytest
@@ -9,6 +8,7 @@ import torch
 from tests.helpers import make_cpu_cache, tiny_ouro_model
 from vllm_rlt import ExecutionConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.request import Request
+from vllm_rlt.worker.ascend import AscendModelRunner
 from vllm_rlt.worker.model_runner import ModelRunner
 
 
@@ -36,50 +36,11 @@ def test_cpu_keeps_copy_semantics():
     runner = runner_cpu()
     reqs = requests()
     hidden = torch.arange(64.0).reshape(2, 32)
-    assert not runner.retain_hidden_batch
     runner._save_batch(reqs, hidden, None)
     expected = reqs[0].hidden_state.clone()
     hidden.fill_(99)
     assert torch.equal(reqs[0].hidden_state, expected)
-    assert runner.hidden_batch is None
-
-
-def test_owned_batch_survives_replacement_and_regrouping():
-    runner = runner_cpu()
-    runner.retain_hidden_batch = True
-    reqs = requests()
-    hidden = torch.arange(64.0).reshape(2, 32)
-    runner._save_batch(reqs, hidden, None)
-    assert runner._gather(reqs, None, 2) is hidden
-    held = reqs[0].hidden_state
-    expected = held.clone()
-    reordered = runner._gather(reqs[::-1], None, 2)
-    assert torch.equal(reordered, hidden.flip(0))
-    assert reordered.data_ptr() != hidden.data_ptr()
-    subset = runner._gather(reqs[:1], None, 1)
-    assert torch.equal(subset, hidden[:1])
-    runner._save_batch(reqs, torch.full_like(hidden, 8), None)
-    del hidden
-    gc.collect()
-    assert torch.equal(held, expected)
-    assert all(torch.equal(r.hidden_state, torch.full((32,), 8.0)) for r in reqs)
-
-
-def test_owned_batch_rejects_reused_id_and_replaced_row():
-    runner = runner_cpu()
-    runner.retain_hidden_batch = True
-    reqs = requests()
-    hidden = torch.arange(64.0).reshape(2, 32)
-    runner._save_batch(reqs, hidden, None)
-    replacement = Request("a", [1], SamplingParams())
-    replacement.hidden_state = reqs[0].hidden_state
-    actual = runner._gather([replacement, reqs[1]], None, 2)
-    assert actual is not hidden and torch.equal(actual, hidden)
-    reqs[0].hidden_state = torch.full_like(reqs[0].hidden_state, 17)
-    actual = runner._gather(reqs, None, 2)
-    assert torch.equal(actual[0], reqs[0].hidden_state)
-    runner.release("a")
-    assert runner.hidden_batch is None
+    assert not hasattr(runner, "hidden_batch")
 
 
 class Event:
@@ -149,7 +110,7 @@ def test_full_depth_finalize_reuses_event_and_still_validates():
     reqs = requests()
     write_depth(runner, reqs, 3)
     source = fake_events(runner, reqs)
-    runner._finalize_npu_batch(reqs)
+    AscendModelRunner._finalize_npu_batch(runner, reqs)
     assert all(runner.events[r.request_id] is source for r in reqs)
     assert not runner.device_ops.created and not runner.boundary_stream.waited
     bad = runner_cpu()
@@ -157,7 +118,7 @@ def test_full_depth_finalize_reuses_event_and_still_validates():
     write_depth(bad, rs, 3, layers=[0])
     fake_events(bad, rs)
     with pytest.raises(RuntimeError, match="every layer"):
-        bad._finalize_npu_batch(rs)
+        AscendModelRunner._finalize_npu_batch(bad, rs)
     assert not bad.device_ops.created
 
 
@@ -166,7 +127,7 @@ def test_early_exit_finalize_copies_all_planes_then_shares_event():
     reqs = requests()
     data = write_depth(runner, reqs, 0)
     source = fake_events(runner, reqs)
-    runner._finalize_npu_batch(reqs)
+    AscendModelRunner._finalize_npu_batch(runner, reqs)
     assert runner.boundary_stream.waited == [source]
     assert len(runner.device_ops.created) == 1
     done = runner.device_ops.created[0]
@@ -187,7 +148,7 @@ def test_partial_finalize_failure_drains_copies_before_cleanup():
     # Keep allocation live but make the second row lack a required layer.
     runner.cache_manager.truncate_suffix("b", 0)
     with pytest.raises(RuntimeError, match="every layer"):
-        runner._finalize_npu_batch(reqs)
+        AscendModelRunner._finalize_npu_batch(runner, reqs)
     assert runner.boundary_stream.synchronized == 1
     assert not runner.device_ops.created
 

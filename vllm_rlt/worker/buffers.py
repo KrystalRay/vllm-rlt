@@ -5,7 +5,6 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from vllm_rlt.device import stream_module
 from vllm_rlt.worker.metadata import KVLayout, KVMetadata
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import UvaBackedTensor, copy_tensor, use_uva_on
@@ -37,7 +36,7 @@ def execution_buffer_bytes(
     total = 0
     if execution.static_buffers:
         # Existing prefill/eager workspaces remain separate from async buffer sets.
-        total += 4 * rows * (hidden + 4 * width + 36) + scheduler.max_num_seqs * hidden
+        total += 4 * rows * (hidden + 4 * width + 36)
     if execution.async_scheduling:
         planes = config.total_ut_steps if cache.layout == "last_exited" else 1
         # Four routing buffer sets, including capacity for an H2D descriptor fallback.
@@ -48,6 +47,8 @@ def execution_buffer_bytes(
         total += (
             (4 * min(rows, scheduler.max_num_seqs) + 2 * scheduler.max_num_seqs) * planes * 8 * 8
         )
+    elif execution.static_buffers:
+        total += scheduler.max_num_seqs * hidden
     # Split prefill holds the staged chunk's hidden rows across batch boundaries.
     stage_rows = prefill_stage_rows(config, scheduler, staged_prefill=staged_prefill)
     total += scheduler.max_num_seqs * stage_rows * hidden
@@ -87,10 +88,9 @@ class Workspace:
 
     def record_done(self):
         """Record the last GPU consumer without waiting or freeing storage."""
-        device_ops = stream_module(self.device)
-        if device_ops is not None:
-            event = device_ops.Event()
-            event.record(device_ops.current_stream(self.device))
+        if self.device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
             self.submissions.complete(event)
 
     def store_metadata(self, layout: KVLayout, size):

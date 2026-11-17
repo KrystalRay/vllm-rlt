@@ -33,8 +33,6 @@ def cache_for(device, enabled=True):
         attention=attention,
         contiguous_kv=enabled,
     )
-    if not enabled and cache._read_cache:
-        cache._read_cache.enabled = False
     for rid in ["a", "b"]:
         assert cache.allocate(rid, 16)
     return cache

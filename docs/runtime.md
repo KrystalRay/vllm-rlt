@@ -63,7 +63,7 @@ if __name__ == "__main__":
 
 The default exit mode remains `ouro`, with the original cumulative hazard policy. For random lookahead, sigmoid is a direct score for exiting after one more loop, not a hazard/CDF. `SamplingParams.exit_threshold` compares this score directly. Threshold 1 disables adaptive exit; `max_loops` always caps execution. Adaptive lookahead cannot exit before round 2, although an explicitly configured hard maximum of 1 is honored. All prompt tokens still run the model's full depth.
 
-Ordinary asynchronous execution requires `ouro_delayed`, `random_lookahead` or `trace`; speculative execution has the separate constraints below. On CUDA it automatically enables reusable static inputs to avoid blocking device metadata transfers; the Ascend eager plan uses the explicit non-static path documented below. CPU supports the same scheduling state machine for tests, with immediately completed operations; it does not simulate GPU parallel execution. `multi_stream` is an independent CUDA execution feature: `False` uses one stream for core, boundary and copies; `True` separates those streams, with or without async scheduling.
+Ordinary asynchronous execution requires `ouro_delayed`, `random_lookahead` or `trace`; speculative execution has the separate constraints below. It automatically enables reusable static inputs to avoid blocking device metadata transfers. CPU supports the same scheduling state machine for tests, with immediately completed operations; it does not simulate GPU parallel execution. `multi_stream` is an independent CUDA execution feature: `False` uses one stream for core, boundary and copies; `True` separates those streams, with or without async scheduling.
 
 CLI flags are shared by offline and serving entrypoints:
 
@@ -76,41 +76,21 @@ OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli --toy --dtype float32 \
 
 For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --attention-backend triton`. Use `--single-stream` for the single-stream pipeline. `--num-blocks` overrides automatic sizing, or specify `--kv-cache-memory-bytes`; these two overrides are mutually exclusive. CPU auto mode keeps a 256-block default. `StageEngine.memory_plan` records the worker-local sizing decision; it is not an attribute of the public `LLM.engine` client.
 
-## Ascend eager execution plans
+## Packed prefill
 
-`ascend_eager` uses the model's explicit BF16 Torch arithmetic. The optional
-`CacheConfig(contiguous_kv=True)` stores private, reserved KV cohorts directly in
-`[batch, kv_head, token, head_dim]` layout. Stable append-only cohorts reuse their
-allocation plan; standalone/irregular writes and generic cache access materialize
-paged storage before using the existing path. That escape can temporarily retain
-both storage representations. Prefix sharing, SHARED KV and incremental allocation
-are rejected with this option.
+`ExecutionConfig.packed_prefill` controls packed prefill attention and metadata
+staging. Its default, `None`, selects packed prefill when the selected backend
+supports it on CUDA with `last_exited` KV and ordinary, non-staged prefill.
+Mixed scheduling, wavefront chunked prefill and sliding-window attention keep
+their existing paths. These selection rules apply to all models.
 
-`ExecutionConfig(coalesce_fixed_prelude=True)` requires asynchronous NPU eager
-execution, with graph/static execution disabled. Fixed full-depth decode performs
-prelude and the recurrent loops in one submission. CODA and output retirement keep
-their existing stop/EOS boundary. The current qualified recipe sets both loop bounds
-to four and uses `ouro_delayed`. Other requests retain ordinary stage boundaries.
+Set `packed_prefill=True` / `--packed-prefill` to require packed prefill, or
+`packed_prefill=False` / `--no-packed-prefill` to disable its staging path.
+Explicit requests still undergo device, model and backend compatibility checks.
 
-The runner keeps an immutable whole GPU sample vector while the next stable cohort
-consumes it. Exact request and row identities guard reuse; regrouping and cancellation
-use the ordinary gather path. GPU allocation lifetime is protected with stream
-recording. One traversal borrows a stream identity only within its uninterrupted
-model call; independent cache operations perform their own stream checks.
-
-Uniform ranges and layer coverage stay compact until a generic consumer needs row
-objects. Shared prefix records detach on individual mutation. An all-layer proof
-records **submitted** KV writes; it does not replace device completion events.
-Truncation/restore invalidate that proof, and failed layer traversals retain their
-partial coverage. RoPE constants are defined in CPU FP32, as in the pinned HF model;
-position embeddings are reused only across compatible depth views of one forward.
-
-The shared offline/server parser exposes `--contiguous-kv` and
-`--coalesce-fixed-prelude`; both default to false. See the
-[Ascend recipe](recipes/ouro_ascend.md#6-owned-kv-and-fixed-depth-asynchronous-execution)
-for the tested configuration and the separate performance/accuracy scope. CUDA's
-default backend selection and feature flags are unchanged; this change has no new
-CUDA device qualification.
+`ExecutionConfig.use_uva` independently controls how input buffers are read.
+`use_uva=False` / `--no-uva` copies them to the GPU and can be combined with
+packed prefill.
 
 ## Execution batches and mixed scheduling
 
@@ -380,8 +360,7 @@ heuristic, not a trained predictor of the next round's exit quality.
 Synchronous execution stores a pending exit depth. Async submits round r+1
 before collecting round r's signal, accumulating each consumed hazard once.
 Both modes use the same policy. Select both with `--exit-mode ouro_delayed`;
-add `--async-scheduling` for async. CUDA automatically enables static buffers;
-the Ascend eager plan below uses non-static execution.
+add `--async-scheduling` for async, which automatically enables static buffers.
 Choose a backend supporting the requested async features. Padding is optional; use
 `--static-buffers --pad-to-power-of-two` to enable it.
 
@@ -398,16 +377,3 @@ multiple concurrent requests are needed to exercise cross-request overlap.
 
 Historical correctness results, including the unresolved BF16 multi-stream
 output divergence, are retained in the [validation history](runtime-history.md#ouro-delayed-validation).
-
-### Optional native host eager plan
-
-`ExecutionConfig(native_eager_plan=True)` / `--native-eager-plan` enables the
-Ouro Ascend host executor with owned contiguous KV. Its C++ code dispatches
-individual eager ATen operations and releases the GIL; it adds no fused model
-operator or device graph. It is disabled by default and rejects other devices,
-backends, static buffers, graphs, boundary KV and speculation. Current weights
-are passed on every layer call. Hooked or customized child modules fall back to
-Python; layer hooks remain supported. Startup requires a C++17 compiler and Ninja,
-and caches the extension under `VLLM_RLT_NATIVE_BUILD_DIR` or
-`~/.cache/vllm-rlt/native-eager`. See the Ascend recipe for the validated fixed-depth
-configuration and the separate compilation/warmup/timing boundaries.

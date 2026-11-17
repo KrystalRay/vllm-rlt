@@ -12,6 +12,7 @@ from vllm_rlt import SamplingParams
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.device import resolve_device
 from vllm_rlt.request import Operation
+from vllm_rlt.worker.ascend import AscendOuroRuntime
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
 from vllm_rlt.worker.metadata import stage_range_metadata
 
@@ -51,9 +52,8 @@ def test_position_plan_reuses_depths_and_expires_between_tokens():
     model = make_npu_model(torch.device("npu:0"))
     expected = None
     for reuse in [False, True]:
-        model.reuse_position_embeddings = reuse
         cache = cache_for(model)
-        runtime = ModelRuntime(model, cache)
+        runtime = (AscendOuroRuntime if reuse else ModelRuntime)(model, cache)
         observed = []
         handle = model.model.rotary_emb.register_forward_hook(lambda *args: observed.append(1))
         actual = []
@@ -94,7 +94,9 @@ def test_failed_traversal_keeps_partial_layer_coverage_visible():
     try:
         hidden = model.prelude(torch.tensor([3, 7, 11], device="npu:0"))
         with pytest.raises(RuntimeError, match="injected layer failure"):
-            model.recurrent_prepared(hidden, batch, cache)
+            AscendOuroRuntime(model, cache).forward(
+                ForwardBatch(Operation.RECURRENT, hidden=hidden, metadata=(batch,))
+            )
     finally:
         handle.remove()
     with pytest.raises(RuntimeError, match="every layer"):
@@ -111,7 +113,11 @@ def test_failed_traversal_keeps_partial_layer_coverage_visible():
         cache._attend_prepared(1, batch, q)
     # Retrying the write after an interrupted traversal must escape to validated
     # paged overwrite semantics, rather than retaining a stale fast lease.
-    actual = model.recurrent_prepared(hidden, batch, cache)[0]
+    actual = (
+        AscendOuroRuntime(model, cache)
+        .forward(ForwardBatch(Operation.RECURRENT, hidden=hidden, metadata=(batch,)))
+        .hidden
+    )
     reference = cache_for(model)
     expected = model.recurrent_prepared(hidden, metadata(reference, 0, 3)[0], reference)[0]
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -157,7 +163,9 @@ def test_completion_proof_does_not_survive_truncation_or_restore():
     cache = cache_for(model)
     hidden = model.prelude(torch.tensor([3, 7, 11], device="npu:0"))
     for batch in metadata(cache, 0, 3):
-        model.recurrent_prepared(hidden, batch, cache)
+        AscendOuroRuntime(model, cache).forward(
+            ForwardBatch(Operation.RECURRENT, hidden=hidden, metadata=(batch,))
+        )
     allocation = cache._get_allocation("a")
     proof = allocation.dense_submitted[cache._plane(3)]
     assert proof.all_layers_end == 3

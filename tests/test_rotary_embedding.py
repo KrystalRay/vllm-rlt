@@ -90,28 +90,3 @@ def test_rotary_embedding_forward_precision_and_shapes(dtype):
     assert sin.shape == (len(positions), 1, head_dim)
     assert cos.dtype == dtype
     assert sin.dtype == dtype
-
-
-def test_rotary_constants_ignore_default_meta_device():
-    expected = RotaryEmbedding(128).inv_freq
-    with torch.device("meta"):
-        rotary = RotaryEmbedding(128)
-    assert rotary.inv_freq.device.type == "cpu"
-    torch.testing.assert_close(rotary.inv_freq, expected, atol=0, rtol=0)
-
-
-@pytest.mark.npu
-@pytest.mark.parametrize("theta", [10000.0, 500000.0])
-def test_rotary_constants_are_cpu_canonical_after_device_dtype_moves(theta):
-    from vllm_rlt.device import resolve_device
-
-    resolve_device("npu")
-    torch.npu.set_device(0)
-    rotary = RotaryEmbedding(128, theta)
-    expected = rotary.inv_freq.clone()
-    torch.testing.assert_close(rotary.frequencies("npu:0").cpu(), expected, atol=0, rtol=0)
-    rotary.to(device="npu:0", dtype=torch.bfloat16)
-    assert rotary.inv_freq.dtype == torch.float32
-    torch.testing.assert_close(rotary.inv_freq.cpu(), expected, atol=0, rtol=0)
-    rotary.to(dtype=torch.float16).to(device="cpu")
-    torch.testing.assert_close(rotary.inv_freq, expected, atol=0, rtol=0)

@@ -80,19 +80,6 @@ class Sampler:
             raise ValueError("non-greedy sampling requires a generator")
         return self.draw(self.probabilities(logits, params), generator)
 
-    def sample_batch(self, logits, params, generators):
-        """Batch independent greedy rows; retain request-local RNG for sampling."""
-        if getattr(self.sample, "__func__", None) is Sampler.sample and all(
-            item.temperature == 0 for item in params
-        ):
-            return logits[: len(params)].argmax(dim=-1)
-        return torch.stack(
-            [
-                self.sample(row, item, generator)
-                for row, item, generator in zip(logits, params, generators)
-            ]
-        )
-
 
 class RngRegistry:
     """Per-request sampling generators for one engine.

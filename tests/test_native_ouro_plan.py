@@ -10,7 +10,8 @@ from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, S
 from vllm_rlt.device import resolve_device
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.request import Operation
-from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
+from vllm_rlt.worker.ascend import AscendOuroRuntime
+from vllm_rlt.worker.executor import ForwardBatch
 
 pytestmark = pytest.mark.npu
 
@@ -23,9 +24,7 @@ def test_native_plan_matches_hidden_and_all_kv_layers():
     expected = None
     for native in [False, True]:
         cache = cache_for(model)
-        runtime = ModelRuntime(model, cache)
-        if native:
-            runtime.enable_native_eager()
+        runtime = AscendOuroRuntime(model, cache, native=native)
         actual = []
         try:
             for start, ids in [(0, [3, 7, 11]), (3, [13])]:

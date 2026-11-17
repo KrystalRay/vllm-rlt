@@ -1,7 +1,6 @@
 """Request-phase execution, random lookahead signals and event-owned CUDA submissions."""
 
 import math
-import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import NamedTuple
@@ -18,7 +17,7 @@ from vllm_rlt.worker.buffers import (
     prefill_stage_rows,
     stage_metadata,
 )
-from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
+from vllm_rlt.worker.cuda_graph import CodaGraphs, PreludeGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
 from vllm_rlt.worker.metadata import UniformSequenceRanges, stage_range_metadata
 from vllm_rlt.worker.output import ModelRunnerOutput
@@ -106,39 +105,6 @@ class PreparedExecution:
     sampling_generators: tuple = ()
 
 
-@dataclass(frozen=True)
-class HiddenBatch:
-    """Immutable eager output; Request.hidden_state remains authoritative.
-
-    Row views retain their owning allocation. Weak request identities and exact
-    view identities prevent reuse after cancellation, replacement or regrouping.
-    Only the latest batch is retained; this is not a second request-state store.
-    """
-
-    hidden: torch.Tensor
-    requests: tuple[weakref.ReferenceType, ...]
-    rows: tuple[torch.Tensor, ...]
-
-    def matches(self, requests):
-        return len(requests) == len(self.rows) and all(
-            owner() is request and request.hidden_state is row
-            for owner, request, row in zip(self.requests, requests, self.rows)
-        )
-
-
-@dataclass(frozen=True)
-class TokenBatch:
-    tokens: torch.Tensor
-    requests: tuple
-    rows: tuple
-
-    def matches(self, requests, sources):
-        return len(requests) == len(self.rows) and all(
-            owner() is request and source is row
-            for owner, request, source, row in zip(self.requests, requests, sources, self.rows)
-        )
-
-
 @dataclass
 class Submission:
     batch: SchedulerOutput | None
@@ -210,8 +176,7 @@ class ModelRunner:
         self.rng = rng if rng is not None else RngRegistry()
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
-        if self.execution_config.native_eager_plan:
-            self.runtime.enable_native_eager()
+        use_async_state = self.execution_config.async_scheduling and self.device.type == "cuda"
         scheduler = scheduler_config or SchedulerConfig()
         self.graphs = (
             RecurrentGraphs(
@@ -226,6 +191,11 @@ class ModelRunner:
         self.coda_graphs = (
             CodaGraphs(model, self.execution_config, cache_manager)
             if self.graphs is not None and getattr(model, "requires_boundary_kv", False)
+            else None
+        )
+        self.prelude_graphs = (
+            PreludeGraphs(model, self.execution_config, cache_manager)
+            if self.coda_graphs is not None and hasattr(model, "prelude_kv_layers")
             else None
         )
         self.input_buffers: dict[torch.dtype, StagedInputTensor] = {
@@ -297,16 +267,6 @@ class ModelRunner:
         self.state_slots = {}
         self.free_state_slots = list(reversed(range(scheduler.max_num_seqs)))
         self.states = None
-        self.hidden_batch = None
-        self.token_batch = None
-        self.retain_hidden_batch = (
-            self.device.type == "npu"
-            and self.execution_config.async_scheduling
-            and cache_manager.backend == "ascend_eager"
-            and not self.execution_config.cuda_graphs
-            and not self.execution_config.static_buffers
-            and getattr(model, "immutable_hidden_outputs", False)
-        )
         # Prompt hidden states staged between split-prefill scheduling boundaries.
         # Sized by the same helper the memory plan reserves with.
         stage_rows = prefill_stage_rows(model.config, scheduler, staged_prefill=staged_prefill)
@@ -378,18 +338,19 @@ class ModelRunner:
                     )
                     for _ in range(2)
                 ]
-            self.states = torch.empty(
-                (scheduler.max_num_seqs, model.config.hidden_size),
-                device=self.device,
-                dtype=parameter.dtype,
-            )
+            if not use_async_state:
+                self.states = torch.empty(
+                    (scheduler.max_num_seqs, model.config.hidden_size),
+                    device=self.device,
+                    dtype=parameter.dtype,
+                )
             # Buffers allocated after stream creation must be visible there too.
             for stream in (self.core_stream, self.boundary_stream):
                 if stream is not None:
                     stream.wait_stream(self.device_ops.current_stream(self.device))
 
         self.async_state = None
-        if self.execution_config.async_scheduling and self.device.type == "cuda":
+        if use_async_state:
             from vllm_rlt.worker.async_state import AsyncState
 
             rows = scheduler.max_num_batched_tokens
@@ -425,7 +386,6 @@ class ModelRunner:
         return workspace
 
     def _save(self, request, state):
-        self.hidden_batch = None
         if self.states is None or (
             self.async_state is not None and request.request_id not in self.async_state.owners
         ):
@@ -647,15 +607,6 @@ class ModelRunner:
             row += span.token_count
 
     def _save_batch(self, requests, hidden, routing):
-        if self.retain_hidden_batch and routing is None and len(hidden) == len(requests):
-            rows = tuple(hidden.unbind(0))
-            for request, state in zip(requests, rows):
-                request.hidden_state = state
-            self.hidden_batch = HiddenBatch(
-                hidden, tuple(weakref.ref(request) for request in requests), rows
-            )
-            return
-        self.hidden_batch = None
         if routing is None:
             for request, state in zip(requests, hidden):
                 self._save(request, state)
@@ -665,32 +616,12 @@ class ModelRunner:
             request.hidden_state = self.states[self.state_slots[request.request_id]]
 
     def _gather(self, requests, workspace, size):
-        saved = self.hidden_batch
-        if (
-            saved is not None
-            and workspace is None
-            and size == len(requests)
-            and saved.matches(requests)
-        ):
-            if self.execution_config.multi_stream:
-                # The next submission can replace all Request row views before
-                # this stream has consumed the previous allocation.
-                saved.hidden.record_stream(self.device_ops.current_stream(self.device))
-            return saved.hidden
-        states = [request.hidden_state for request in requests]
         if workspace is None:
-            hidden = torch.stack(states)
-        else:
-            hidden = workspace.hidden[:size]
-            hidden.zero_()
-            for row, state in enumerate(states):
-                hidden[row].copy_(state)
-        if hidden.device.type == "npu" and self.execution_config.multi_stream:
-            # Request states can be replaced before this stream consumes them.
-            # NPU uses these tensors instead of CUDA's persistent state slots.
-            stream = self.device_ops.current_stream(hidden.device)
-            for state in states:
-                state.record_stream(stream)
+            return torch.stack([r.hidden_state for r in requests])
+        hidden = workspace.hidden[:size]
+        hidden.zero_()
+        for row, request in enumerate(requests):
+            hidden[row].copy_(request.hidden_state)
         return hidden
 
     def _prepare_prefill_coda(self, ids, positions, requests, kv=None):
@@ -793,7 +724,7 @@ class ModelRunner:
             and batch.loop_count
             and self.cache_manager.layout != "shared"
             and self.cache_manager.attention_capabilities.packed_prefill
-            and self.execution_config.prefill_uva
+            and self.execution_config.packed_prefill
         )
 
     def _prepare_loop_inputs(self, batch, packed_metadata=None):
@@ -862,8 +793,8 @@ class ModelRunner:
         cache = self.cache_manager
         spans = batch.spans
         return (
-            self.metadata.range_plans_enabled
-            and self.device.type == "npu"
+            self.device.type == "npu"
+            and self.metadata.range_plans_enabled
             and cache.attention_capabilities.sequence_ranges
             and cache.layout == "last_exited"
             and not cache.enable_prefix_caching
@@ -927,7 +858,7 @@ class ModelRunner:
             else:
                 tokens = (
                     self._prepare_tokens(prepared, prepared.batch.num_rows)
-                    if forward.tokens is None
+                    if self.device.type == "npu" and forward.tokens is None
                     else input_view(forward.tokens)
                 )
                 metadata = tuple(self.metadata.bind(kv, uploaded) for kv in forward.metadata)
@@ -1023,7 +954,8 @@ class ModelRunner:
         if batch.operation == Operation.CODA:
             prepared = replace(prepared, sampling_params=tuple(r.sampling_params for r in requests))
         if (
-            batch.operation == Operation.PRELUDE
+            self.device.type == "npu"
+            and batch.operation == Operation.PRELUDE
             and batch.loop_count
             and not batch.has_chunks
             and all(span.input_tokens is None for span in batch.spans)
@@ -1190,6 +1122,7 @@ class ModelRunner:
                 tokens=prepared.token_ids,
                 prelude_coda_kv_metadata=kv_metadata,
                 generators=self._prepare_generators(requests) if kv_metadata else None,
+                graphs=self.prelude_graphs if kv_metadata else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
         hidden = self._load_hidden(batch, prepared, workspace, size)
@@ -1237,37 +1170,11 @@ class ModelRunner:
         routing = prepared.routing if prepared is not None else None
         self._save_batch([span.request for span in batch.spans], hidden, routing)
 
-    def _retain_device_tokens(self, batch, values, rows):
-        self.token_batch = None
-        if (
-            self.device.type != "npu"
-            or self.cache_manager._contiguous is None
-            or not self.retain_hidden_batch
-            or len(rows) != len(batch.requests)
-            or list(rows) != list(range(len(batch.requests)))
-        ):
-            return
-        requests = [item.request for item in batch.requests]
-        self.token_batch = TokenBatch(
-            values,
-            tuple(weakref.ref(r) for r in requests),
-            tuple(r.input_token_tensor for r in requests),
-        )
-
     def _prepare_tokens(self, prepared, size):
         """Materialize snapshotted token sources on the current compute stream."""
         sources = prepared.token_sources
         workspace = prepared.workspace
-        borrowed = prepared.token_ids
-        stream = (
-            self.device_ops.current_stream(self.device) if self.device_ops is not None else None
-        )
-        if borrowed is not None and prepared.routing is None and size == len(borrowed):
-            tokens = borrowed
-            tokens.record_stream(stream)
-            if self.token_batch is not None and self.token_batch.tokens is tokens:
-                self.token_batch = None
-        elif prepared.routing is not None:
+        if prepared.routing is not None:
             tokens = prepared.routing.gather(tokens=True)
         elif all(isinstance(source, torch.Tensor) for source in sources):
             tokens = torch.stack(sources)
@@ -1290,12 +1197,8 @@ class ModelRunner:
         if prepared.routing is None and size > len(tokens):
             tokens = torch.cat((tokens, tokens.new_zeros(size - len(tokens))))
         for span, source in zip(prepared.batch.spans, sources):
-            if (
-                tokens is not borrowed
-                and isinstance(source, torch.Tensor)
-                and source.device.type in ("cuda", "npu")
-            ):
-                source.record_stream(stream)
+            if isinstance(source, torch.Tensor) and source.is_cuda:
+                source.record_stream(torch.cuda.current_stream(self.device))
             if span.request.input_token_tensor is source:
                 span.request.input_token_tensor = None
         return tokens
@@ -1331,9 +1234,21 @@ class ModelRunner:
                         )
                         values = selected.float().sigmoid()
             elif forward.compute_logits:
-                values = self.sampler.sample_batch(
-                    result.logits, prepared.sampling_params, prepared.sampling_generators
-                )
+                if self.device.type == "npu":
+                    values = self.sampler.sample_batch(
+                        result.logits, prepared.sampling_params, prepared.sampling_generators
+                    )
+                else:
+                    values = torch.stack(
+                        [
+                            self.sampler.sample(row, params, generator)
+                            for row, params, generator in zip(
+                                result.logits,
+                                prepared.sampling_params,
+                                prepared.sampling_generators,
+                            )
+                        ]
+                    )
                 if prepared.routing is not None:
                     prepared.routing.scatter(values, tokens=True)
         return values
@@ -1367,16 +1282,12 @@ class ModelRunner:
     def _wait_for_requests(self, batch, stream):
         # A previous batch often gives many requests the same completion event.
         dependencies = set()
-        saved = self.hidden_batch
-        retained = saved is not None and saved.matches([span.request for span in batch.spans])
-        if retained:
-            saved.hidden.record_stream(stream)
         for span in batch.spans:
             event = self.events.get(span.request.request_id)
             if event is not None and event not in dependencies:
                 stream.wait_event(event)
                 dependencies.add(event)
-            if not retained and span.request.hidden_state is not None:
+            if span.request.hidden_state is not None:
                 span.request.hidden_state.record_stream(stream)
 
     @torch.inference_mode()
@@ -1500,13 +1411,6 @@ class ModelRunner:
     def finalize_many(self, requests):
         if not requests:
             return
-        if (
-            self.device.type == "npu"
-            and self.execution_config.async_scheduling
-            and self.cache_manager.backend == "ascend_eager"
-        ):
-            self._finalize_npu_batch(requests)
-            return
         if self.async_state is None or self.cache_manager.layout == "shared":
             for request in requests:
                 self.finalize(request)
@@ -1517,7 +1421,7 @@ class ModelRunner:
         copies = []
         for request in requests:
             depth = request.loops_done - 1
-            if not cache.token_written(request.request_id, request.position, depth):
+            if not cache.exit_written(request.request_id, request.position, depth):
                 raise RuntimeError("cannot finalize before every layer has written KV")
             if depth + 1 < cache.max_loops:
                 copies.append(request)
@@ -1530,7 +1434,7 @@ class ModelRunner:
             len(copies),
             finalize=True,
         )
-        with self.device_ops.stream(self.boundary_stream):
+        with torch.cuda.stream(self.boundary_stream):
             for request in copies:
                 event = self.events.get(request.request_id)
                 if event is not None:
@@ -1572,46 +1476,7 @@ class ModelRunner:
                 event.record(stream)
                 self.events[request.request_id] = event
 
-    def _finalize_npu_batch(self, requests):
-        cache = self.cache_manager
-        copies = []
-        for request in requests:
-            depth = request.loops_done - 1
-            if cache.layout == "shared" or depth + 1 == cache.max_loops:
-                # This still verifies every required layer. With no destination
-                # there is no device work: the existing core event is sufficient.
-                cache.finalize_token(request.request_id, request.position, depth)
-            else:
-                copies.append(request)
-        if not copies:
-            return
-        stream = self.boundary_stream
-        with self.device_ops.stream(stream):
-            try:
-                dependencies = {
-                    self.events[request.request_id]
-                    for request in copies
-                    if request.request_id in self.events
-                }
-                for event in dependencies:
-                    stream.wait_event(event)
-                for request in copies:
-                    cache.finalize_token(
-                        request.request_id, request.position, request.loops_done - 1
-                    )
-                done = self.device_ops.Event()
-                done.record(stream)
-            except Exception:
-                # A later request can fail after earlier copies were enqueued.
-                # Finish those readers before cleanup may recycle their pages.
-                stream.synchronize()
-                raise
-        for request in copies:
-            self.events[request.request_id] = done
-
     def _free_runner_slot(self, request_id):
-        self.hidden_batch = None
-        self.token_batch = None
         # The latest submission or KV-finalization event follows earlier work
         # through stream dependencies. Wait before recycling this request's slot.
         event = self.events.pop(request_id, None)

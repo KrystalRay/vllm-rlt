@@ -82,18 +82,17 @@ class StageEngine:
             if parameter.dtype != torch.bfloat16:
                 raise ValueError("NPU Ouro requires BF16 weights")
             if (
-                self.execution_config.async_scheduling
-                or self.execution_config.cuda_graphs
+                self.execution_config.cuda_graphs
                 or self.execution_config.prefill_uva
                 or speculative_config is not None
                 or self.stage_config.role != "prefill_decode"
                 or scheduler_config.enable_preemption
                 or cache_config.enable_prefix_caching
                 or cache_config.layout != "last_exited"
-                or self.exit_config.mode != "ouro"
+                or self.exit_config.mode not in ("ouro", "ouro_delayed")
             ):
                 raise ValueError(
-                    "NPU Ouro requires synchronous local execution, ouro exit mode and "
+                    "NPU Ouro requires local execution, ouro/ouro_delayed exit mode and "
                     "last_exited KV without speculation, graphs, preemption or prefix caching"
                 )
         staged_prefill = requires_staged_prefill(
@@ -190,11 +189,27 @@ class StageEngine:
                 packed_prefill=self.execution_config.prefill_uva,
                 cuda_graphs=self.execution_config.cuda_graphs,
                 async_scheduling=(
-                    parameter.device.type == "cuda" and self.execution_config.async_scheduling
+                    parameter.device.type in ("cuda", "npu")
+                    and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
+                sequence_ranges=cache_config.contiguous_kv,
+                owned_contiguous_kv=cache_config.contiguous_kv,
             ),
         )
+        if self.execution_config.native_eager_plan and (
+            parameter.device.type != "npu"
+            or not cache_config.contiguous_kv
+            or attention.info["selected_backend"] != "ascend_eager"
+            or self.execution_config.cuda_graphs
+            or self.execution_config.static_buffers
+            or getattr(model, "requires_boundary_kv", False)
+            or speculative_config is not None
+        ):
+            raise ValueError(
+                "native eager plan requires Ascend eager owned KV "
+                "without graphs, static buffers or speculation"
+            )
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -218,9 +233,20 @@ class StageEngine:
             attention=attention,
             enable_prefix_caching=cache_config.enable_prefix_caching,
             incremental_allocation=cache_config.incremental_allocation,
+            contiguous_kv=cache_config.contiguous_kv,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
         )
+        if self.execution_config.coalesce_fixed_prelude and (
+            parameter.device.type != "npu"
+            or not self.execution_config.async_scheduling
+            or self.execution_config.static_buffers
+            or self.execution_config.cuda_graphs
+            or getattr(model, "requires_boundary_kv", False)
+            or attention.info["selected_backend"] != "ascend_eager"
+            or speculative_config is not None
+        ):
+            raise ValueError("fixed decode prelude requires asynchronous Ascend eager execution")
         self.scheduler = Scheduler(
             scheduler_config,
             self.cache_manager,
@@ -229,6 +255,10 @@ class StageEngine:
             total_ut_steps=config.total_ut_steps,
             eos_token_id=config.eos_token_id,
             exit_mode=self.exit_config.mode,
+            coalesce_fixed_decode=(
+                parameter.device.type == "npu" and self.execution_config.async_scheduling
+            ),
+            coalesce_fixed_prelude=self.execution_config.coalesce_fixed_prelude,
         )
         self.connector = connector
         # One RNG registry per engine, shared by both runners: the CODA and
@@ -892,6 +922,7 @@ class StageEngine:
         )
         for row in update.next_prelude:
             batch.requests[row].request.input_token_tensor = ticket.device_values[row]
+        self.model_runner._retain_device_tokens(batch, ticket.device_values, update.next_prelude)
         for row in update.retain_signal:
             self._pending_exit_signals[batch.requests[row].request.request_id] = SignalHandle(
                 ticket, row

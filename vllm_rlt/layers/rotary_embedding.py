@@ -37,13 +37,17 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", self.frequencies(), persistent=False)
 
     def frequencies(self, device: torch.device | str | None = None) -> torch.Tensor:
-        return 1.0 / (
+        # HF initializes these FP32 constants on CPU before device placement.
+        # Re-evaluating pow on an accelerator changes the rounded constants,
+        # then BF16 cos/sin and recurrent logits. Keep one host definition for
+        # initialization, dtype conversion and checkpoint loading alike.
+        frequencies = 1.0 / (
             self.rope_theta
             ** (
-                torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
-                / self.head_dim
+                torch.arange(0, self.head_dim, 2, dtype=torch.float32, device="cpu") / self.head_dim
             )
         )
+        return frequencies.to(device=device)
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse=recurse)

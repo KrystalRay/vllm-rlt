@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from vllm_rlt.device import stream_module
 from vllm_rlt.worker.metadata import KVLayout, KVMetadata
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import UvaBackedTensor, copy_tensor, use_uva_on
@@ -86,9 +87,10 @@ class Workspace:
 
     def record_done(self):
         """Record the last GPU consumer without waiting or freeing storage."""
-        if self.device.type == "cuda":
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(self.device))
+        device_ops = stream_module(self.device)
+        if device_ops is not None:
+            event = device_ops.Event()
+            event.record(device_ops.current_stream(self.device))
             self.submissions.complete(event)
 
     def store_metadata(self, layout: KVLayout, size):

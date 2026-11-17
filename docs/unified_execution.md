@@ -405,6 +405,20 @@ and checks are retained in the local `experiments/core-perf-20261021` campaign.
 Earlier PR #30/#31 measurements use different workloads and timing boundaries
 and are not mixed into these charts.
 
+## Ascend engine-only validation
+
+The [November Ascend recipe](recipes/ouro_ascend.md#6-owned-kv-and-fixed-depth-asynchronous-execution)
+uses the same separation of unprofiled timing, correctness and paired ops-only/full
+attribution described above. It evaluates explicit Torch eager arithmetic against
+the pinned official HF eager implementation on 910B3. The new path reuses stable
+execution plans, GPU token batches, KV layout and submitted-prefix proofs; it does
+not add model-operator fusion or graph replay.
+
+Its S8/S64/L8 cases have 32-token outputs and distinct resident/client limits.
+They must not be combined with the October B300/FA4 W1–W7 table. The recipe records
+source/environment pins, repeated results, actual completion counts, and coverage
+limits; its accuracy checks do not establish GSM8K or full serving qualification.
+
 ## Where the details live
 
 | Question | Guide |

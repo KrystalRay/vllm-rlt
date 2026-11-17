@@ -8,10 +8,12 @@ prompt blocks can be shared through the prefix cache.
 
 import hashlib
 import struct
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import cached_property
 from numbers import Integral
 
 import torch
@@ -47,8 +49,57 @@ class _WrittenPositions:
             self.pending.remove(self.prefix)
             self.prefix += 1
 
+    def add_range(self, start: int, end: int) -> None:
+        """Record [start, end), preserving sparse/out-of-order coverage."""
+        if start >= end or end <= self.prefix:
+            return
+        if start > self.prefix:
+            self.pending.update(range(start, end))
+            return
+        self.prefix = end
+        if self.pending:
+            self.pending = {position for position in self.pending if position >= end}
+            while self.prefix in self.pending:
+                self.pending.remove(self.prefix)
+                self.prefix += 1
+
     def __contains__(self, position: int) -> bool:
         return position < self.prefix or position in self.pending
+
+
+@dataclass
+class _DenseFrontier:
+    # Submission coverage only. Device completion still belongs to stream events.
+    end: int
+    all_layers_end: int = 0
+
+
+class _CohortWrittenPositions(_WrittenPositions):
+    """Share an append-only cohort frontier; detach on an individual mutation."""
+
+    def __init__(self, source, frontier):
+        self._prefix = source.prefix
+        self.pending = source.pending.copy()
+        self._frontier = frontier
+
+    @property
+    def prefix(self):
+        return self._prefix if self._frontier is None else self._frontier.end
+
+    @prefix.setter
+    def prefix(self, value):
+        self._prefix, self._frontier = value, None
+
+    def _detach(self):
+        self.prefix = self.prefix
+
+    def add(self, position):
+        self._detach()
+        super().add(position)
+
+    def add_range(self, start, end):
+        self._detach()
+        super().add_range(start, end)
 
 
 @dataclass
@@ -58,6 +109,62 @@ class _Allocation:
     written: list[list[_WrittenPositions]]
     transfer_leases: set[str] = field(default_factory=set)
     release_requested: bool = False
+    dense_submitted: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _SequenceCoverage:
+    allocation: _Allocation
+    plane: int
+    ranges: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _PreparedCoverage:
+    allocation_epoch: int
+    sequences: Sequence[_SequenceCoverage]
+
+
+class _LazyRangeCoverage(Sequence):
+    """Materialize row coverage only when the generic paged path needs it."""
+
+    def __init__(self, ranges, shared):
+        self.ranges, self.shared, self.sequences = ranges, shared, None
+
+    def __len__(self):
+        return len(self.ranges)
+
+    def __getitem__(self, index):
+        return tuple(self)[index]
+
+    def __iter__(self):
+        if self.sequences is None:
+            self.sequences = tuple(
+                _SequenceCoverage(r.allocation, 0 if self.shared else r.depth, ((r.start, r.end),))
+                for r in self.ranges
+            )
+        return iter(self.sequences)
+
+
+def _sequence_coverage(rows, plane):
+    """Collapse query rows once, leaving written state owned by the allocation."""
+    grouped = {}
+    for allocation, depth, position in rows:
+        key = (id(allocation), plane(depth))
+        if key not in grouped:
+            grouped[key] = (allocation, [])
+        grouped[key][1].append(position)
+    sequences = []
+    for (_, storage_plane), (allocation, positions) in grouped.items():
+        ranges = []
+        for position in sorted(positions):
+            if ranges and position <= ranges[-1][1]:
+                start, end = ranges[-1]
+                ranges[-1] = (start, max(end, position + 1))
+            else:
+                ranges.append((position, position + 1))
+        sequences.append(_SequenceCoverage(allocation, storage_plane, tuple(ranges)))
+    return tuple(sequences)
 
 
 @dataclass(frozen=True)
@@ -76,6 +183,116 @@ class KVSnapshot:
     written: list[list[_WrittenPositions]]
     keys: torch.Tensor
     values: torch.Tensor
+
+
+@dataclass(frozen=True)
+class EagerLayerInputs:
+    history: tuple | None
+    mask: torch.Tensor
+    batch_size: int
+    token_start: int
+    query_tokens: int
+    head_dim: int
+    kv_heads: int
+    append_plan: object
+
+
+class _KVTraversal:
+    """One validated dense traversal inside an inference-only model call."""
+
+    def __init__(self, manager, stream, batch, storage, context):
+        self.manager, self.stream, self.batch = manager, stream, batch
+        self.storage, self.context = storage, context
+        self.epoch = manager._allocation_epoch
+        self.pair = self.layer = None
+        self.next_layer = 0
+        self.ordered = True
+
+    def _active(self, batch):
+        return (
+            batch is self.batch
+            and self.manager._contiguous is self.storage
+            and self.manager._allocation_epoch == self.epoch
+        )
+
+    def _write_prepared(self, layer, batch, k, v):
+        manager = self.manager
+        if not self._active(batch):
+            return manager._write_prepared(layer, batch, k, v)
+        manager._validate_layer(layer)
+        manager._validate_tensor(k, len(batch.position_ids), "k")
+        manager._validate_tensor(v, len(batch.position_ids), "v")
+        if not self.storage._append(layer, batch, k, v, self.context):
+            self.pair = self.layer = None
+            return manager._write_prepared(layer, batch, k, v, _stream=self.stream)
+        self.pair = self.storage.groups[self.context[-1], layer].pair
+        self.ordered = self.ordered and layer == self.next_layer
+        self.next_layer += 1
+        self.layer = layer
+
+    def prepare_native(self, layer, hidden):
+        if not self._active(self.batch):
+            return None
+        self.manager._validate_layer(layer)
+        size, start, count, _ = self.context
+        if (
+            hidden.ndim != 2
+            or len(hidden) != size * count
+            or hidden.device != self.manager.device
+            or hidden.dtype != self.manager.dtype
+        ):
+            raise ValueError("native eager input must match the validated cache schema")
+        plan = self.storage.prepare_append(layer, self.batch, self.context)
+        if plan is None:
+            return None
+        _, mask = self.manager.attention.kernel.prepare_eager_attention(
+            hidden, self.batch, stream=self.stream
+        )
+        return EagerLayerInputs(
+            plan.history,
+            mask,
+            size,
+            start,
+            count,
+            self.manager.head_dim,
+            self.manager.num_kv_heads,
+            plan,
+        )
+
+    def commit_native(self, layer, inputs, pair):
+        if not self._active(self.batch):
+            raise RuntimeError("stale native eager traversal")
+        expected = (
+            inputs.batch_size,
+            inputs.kv_heads,
+            inputs.token_start + inputs.query_tokens,
+            inputs.head_dim,
+        )
+        if any(
+            tuple(x.shape) != expected
+            or x.device != self.manager.device
+            or x.dtype != self.manager.dtype
+            for x in pair
+        ):
+            raise ValueError("native eager KV output does not match the cache schema")
+        self.storage.commit_append(layer, self.batch, self.context, inputs.append_plan, pair)
+        self.pair = pair
+        self.ordered = self.ordered and layer == self.next_layer
+        self.next_layer += 1
+        self.layer = layer
+
+    def finish(self):
+        if self._active(self.batch) and self.ordered and self.next_layer == self.manager.num_layers:
+            group = self.storage.groups.get((self.context[-1], 0))
+            if group is not None and group.allocations is self.batch.allocations:
+                group.frontier.all_layers_end = self.context[1] + self.context[2]
+
+    def _attend_prepared(self, layer, batch, q):
+        manager = self.manager
+        if not self._active(batch) or layer != self.layer or self.pair is None:
+            return manager._attend_prepared(layer, batch, q)
+        manager._validate_tensor(q, len(batch.position_ids), "q", query=True)
+        return manager.attention.kernel.attend_contiguous(q, self.pair, batch, stream=self.stream)
 
 
 class KVCacheManager:
@@ -104,6 +321,7 @@ class KVCacheManager:
         recurrent_layers: Sequence[int] | None = None,
         *,
         attention: AttentionBackend | None = None,
+        contiguous_kv: bool = False,
     ):
         for name, value in (
             ("num_layers", num_layers),
@@ -142,12 +360,56 @@ class KVCacheManager:
         self.attention_info = self.attention.info
         self.backend = self.attention_info["selected_backend"]
         shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
-        self.key_cache = torch.empty(shape, device=self.device, dtype=dtype)
-        self.value_cache = torch.empty_like(self.key_cache)
-        # Resolve an implicit CUDA index to the actual storage device once.
-        self.device = self.key_cache.device
+        if contiguous_kv and (
+            not self.attention_capabilities.sequence_ranges
+            or not self.attention_capabilities.owned_contiguous_kv
+            or layout != "last_exited"
+            or enable_prefix_caching
+            or incremental_allocation
+        ):
+            raise ValueError(
+                "contiguous KV requires private reserved sequence-range storage "
+                "and owned contiguous attention"
+            )
+        self._paged_shape = shape
+        self._contiguous = None
+        self._key_cache = self._value_cache = None
+        # Resolve an implicit device without allocating the optional paged pool.
+        self.device = torch.empty(0, device=self.device, dtype=dtype).device
+        if contiguous_kv:
+            from vllm_rlt.kernels.contiguous_kv import ContiguousKVStorage
+
+            self._contiguous = ContiguousKVStorage(
+                num_kv_heads, head_dim, self.device, publish_coverage=self._publish_dense_coverage
+            )
+        else:
+            self._key_cache = torch.empty(shape, device=self.device, dtype=dtype)
+            self._value_cache = torch.empty_like(self._key_cache)
+            self.key_cache, self.value_cache = self._key_cache, self._value_cache
+        self._read_cache = None
+        if not contiguous_kv and self.device.type == "npu" and self.backend == "ascend_eager":
+            from vllm_rlt.kernels.ascend_read_cache import AscendKVReadCache
+
+            self._read_cache = AscendKVReadCache(
+                num_layers,
+                self.storage_depths,
+                num_kv_heads,
+                head_dim,
+                dtype,
+                self.device,
+                2 * self._key_cache.numel() * self._key_cache.element_size(),
+            )
         self._free_blocks = list(reversed(range(num_blocks)))
         self._allocations: dict[str, _Allocation] = {}
+        self._allocation_epoch = 0
+        # Only the Ascend host-metadata path changes. Weak keys must not keep
+        # request descriptors or their staged tensor storage alive.
+        self._prepared_coverage = (
+            weakref.WeakKeyDictionary()
+            if self.device.type == "npu" and self.backend == "ascend_eager"
+            else None
+        )
+        self._validated_range_tables = weakref.WeakKeyDictionary()
         self.enable_prefix_caching = enable_prefix_caching
         self.incremental_allocation = incremental_allocation
         # Full allocation already reserves each request's maximum KV capacity.
@@ -315,6 +577,8 @@ class KVCacheManager:
                 for _ in range(self.storage_depths)
             ],
         )
+        self._allocation_epoch += 1
+        self._invalidate_read_cache(preserve_contiguous=True)
         self.prefix_queries += 1
         self.prefix_hits += length
         return True
@@ -334,6 +598,8 @@ class KVCacheManager:
             t + tuple(blocks[d * extra : (d + 1) * extra])
             for d, t in enumerate(allocation.block_tables)
         )
+        self._allocation_epoch += 1
+        self._invalidate_read_cache(preserve_contiguous=True)
         return True
 
     def truncate_suffix(self, request_id: str, frontier: int) -> None:
@@ -351,6 +617,8 @@ class KVCacheManager:
         for table in allocation.block_tables:
             if any(self._refs[b] > 1 for b in table[frontier // self.block_size :]):
                 raise ValueError("cannot truncate shared prefix pages")
+        self._invalidate_read_cache()
+        allocation.dense_submitted.clear()
         for plane in allocation.written:
             for written in plane:
                 written.prefix = min(written.prefix, frontier)
@@ -358,14 +626,19 @@ class KVCacheManager:
 
     def free(self, request_id: str) -> None:
         allocation = self._allocations.get(request_id)
+        self._invalidate_read_cache(preserve_contiguous=True)
         if allocation is not None and allocation.transfer_leases:
             allocation.release_requested = True
             return
+        if self._contiguous is not None and allocation is not None:
+            self._contiguous.release(allocation, self.num_layers, self.storage_depths)
         allocation = self._allocations.pop(request_id, None)
         if allocation is not None:
+            self._allocation_epoch += 1
             self._drop_refs(b for table in allocation.block_tables for b in reversed(table))
 
     def pin_transfer(self, request_id: str, transfer_id: str):
+        self._invalidate_read_cache()
         allocation = self._get_allocation(request_id)
         if allocation.release_requested:
             raise RuntimeError("cannot transfer KV scheduled for release")
@@ -386,6 +659,7 @@ class KVCacheManager:
             raise RuntimeError("cannot activate cancelled KV")
         if any(w.prefix != start or w.pending for plane in allocation.written for w in plane):
             raise RuntimeError("KV prefix was already initialized")
+        allocation.dense_submitted.clear()
         for plane in allocation.written:
             for written in plane:
                 written.prefix = length
@@ -451,6 +725,9 @@ class KVCacheManager:
         allocation = self._get_allocation(request_id)
         self._validate_depth(exit_depth)
         self._validate_position(allocation, position)
+        proof = allocation.dense_submitted.get(self._plane(exit_depth))
+        if proof is not None and position < proof.all_layers_end:
+            return allocation
         if any(
             position not in allocation.written[self._plane(exit_depth)][layer]
             for layer in self.recurrent_layers
@@ -505,10 +782,12 @@ class KVCacheManager:
             raise ValueError("snapshot page count does not match the allocation")
         if any(w.prefix or w.pending for plane in allocation.written for w in plane):
             raise RuntimeError("cannot restore into an allocation that already holds KV")
+        self._invalidate_read_cache()
         blocks = [b for table in allocation.block_tables for b in table]
         for row, block in enumerate(blocks):
             self.key_cache[block].copy_(snapshot.keys[row])
             self.value_cache[block].copy_(snapshot.values[row])
+        allocation.dense_submitted.clear()
         allocation.written = deepcopy(snapshot.written)
 
     def _plane(self, depth: int) -> int:
@@ -622,12 +901,43 @@ class KVCacheManager:
         host = torch.tensor(values, dtype=dtype, pin_memory=self.device.type == "cuda")
         return host.to(self.device, non_blocking=True)
 
-    def _require_live_batch(self, batch: KVMetadata | DeviceKVMetadata) -> None:
+    def _require_live_batch(self, batch: KVMetadata | DeviceKVMetadata):
         if isinstance(batch, KVMetadata) and batch.owner is not self:
             raise ValueError("prepared KV batch belongs to a different cache manager")
-        for request_id, allocation in batch.allocations:
-            if self._allocations.get(request_id) is not allocation:
-                raise RuntimeError(f"stale prepared KV batch for request {request_id!r}")
+        if (
+            isinstance(batch, KVMetadata)
+            and batch.sequence_ranges is not None
+            and not self.attention_capabilities.sequence_ranges
+        ):
+            raise ValueError("attention backend does not support compact sequence ranges")
+        plan = None
+        reusable = self._prepared_coverage is not None and isinstance(batch, KVMetadata)
+        epoch = self._allocation_epoch
+        if reusable:
+            plan = self._prepared_coverage.get(batch)
+            if plan is not None and plan.allocation_epoch == epoch:
+                return plan
+        table_plan = batch.table_plan if reusable else None
+        validated = self._validated_range_tables.get(table_plan) if table_plan is not None else None
+        if validated is None or validated[0] != epoch or validated[1] is not batch.allocations:
+            for request_id, allocation in batch.allocations:
+                if self._allocations.get(request_id) is not allocation:
+                    raise RuntimeError(f"stale prepared KV batch for request {request_id!r}")
+            if table_plan is not None:
+                self._validated_range_tables[table_plan] = epoch, batch.allocations
+        if reusable:
+            plan = _PreparedCoverage(
+                epoch,
+                (
+                    _LazyRangeCoverage(batch.sequence_ranges, self.layout == "shared")
+                    if batch.sequence_ranges is not None
+                    else _sequence_coverage(batch.rows, self._plane)
+                )
+                if plan is None
+                else plan.sequences,
+            )
+            self._prepared_coverage[batch] = plan
+        return plan
 
     def _validate_tensor(self, tensor, batch_size, name, *, query=False):
         if tensor.ndim != 3 or tensor.shape[0] != batch_size or tensor.shape[-1] != self.head_dim:
@@ -639,6 +949,43 @@ class KVCacheManager:
             raise ValueError(f"{name} must have {self.num_kv_heads} KV heads")
         if tensor.device != self.device or tensor.dtype != self.dtype:
             raise ValueError(f"{name} must use device {self.device} and dtype {self.dtype}")
+
+    @staticmethod
+    def _publish_dense_coverage(spans, depth, layer, end, frontier):
+        """Record submitted copies after storage has enqueued both K and V.
+
+        Stable cohorts advance one shared proof. Individual mutation detaches a
+        row, and an interrupted traversal never publishes all-layer coverage.
+        """
+        if frontier is not None:
+            frontier.end = end
+            return frontier
+        frontier = _DenseFrontier(end)
+        for span in spans:
+            previous = span.allocation.written[depth][layer]
+            span.allocation.written[depth][layer] = _CohortWrittenPositions(previous, frontier)
+            if layer == 0:
+                span.allocation.dense_submitted[depth] = frontier
+        return frontier
+
+    def _begin_traversal(self, batch):
+        if (
+            self._contiguous is None
+            or not isinstance(batch, KVMetadata)
+            or self.device.type != "npu"
+            or not torch.is_inference_mode_enabled()
+        ):
+            return self
+        if not batch.writable:
+            return self
+        coverage = self._require_live_batch(batch)
+        if coverage is None:
+            return self
+        stream = torch.npu.current_stream(self.device)
+        context = self._contiguous._context(batch, stream)
+        if context is None:
+            return self
+        return _KVTraversal(self, stream, batch, self._contiguous, context)
 
     @torch.no_grad()
     def write(
@@ -663,10 +1010,18 @@ class KVCacheManager:
 
     @torch.no_grad()
     def _write_prepared(
-        self, layer: int, batch: KVMetadata | DeviceKVMetadata, k: torch.Tensor, v: torch.Tensor
+        self,
+        layer: int,
+        batch: KVMetadata | DeviceKVMetadata,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        _stream=None,
     ) -> None:
         self._validate_layer(layer)
-        self._require_live_batch(batch)
+        coverage = self._require_live_batch(batch)
+        if not isinstance(batch, KVMetadata) or batch.sequence_ranges is None:
+            self._invalidate_read_cache()
         if isinstance(batch, DeviceKVMetadata):
             self._validate_tensor(k, len(batch.position_ids), "k")
             self._validate_tensor(v, len(batch.position_ids), "v")
@@ -684,7 +1039,16 @@ class KVCacheManager:
         self._validate_tensor(v, len(batch.position_ids), "v")
         if not batch.rows:
             return
-        if self.device.type == "npu" and self.backend == "ascend_eager":
+        direct = self._contiguous is not None and self._contiguous.append(
+            layer, batch, k, v, stream=_stream
+        )
+        if direct:
+            # The store advances a shared layer frontier only after both KV
+            # writes enqueue. Public coverage readers still observe each row.
+            return
+        elif self.device.type == "npu" and self.backend == "ascend_eager":
+            if batch.deferred_addresses:
+                batch = self.metadata_builder.materialize_paged(batch)
             if not hasattr(self, "_npu_writer"):
                 from vllm_rlt.kernels.ascend_kv import AscendKVWriter
 
@@ -694,14 +1058,24 @@ class KVCacheManager:
                 self.value_cache,
                 layer,
                 batch,
-                k[: len(batch.rows)],
-                v[: len(batch.rows)],
+                k if len(k) == len(batch.rows) else k[: len(batch.rows)],
+                v if len(v) == len(batch.rows) else v[: len(batch.rows)],
             )
         else:
             self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
             self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
-        for allocation, depth, position in batch.rows:
-            allocation.written[self._plane(depth)][layer].add(position)
+        if self._read_cache is not None and batch.sequence_ranges is not None:
+            self._read_cache.record(layer, batch, k, v)
+        if coverage is None:
+            for allocation, depth, position in batch.rows:
+                allocation.written[self._plane(depth)][layer].add(position)
+        else:
+            # Advance only this layer, only after BOTH device copies enqueue.
+            # Keep holes and partial-layer writes observable to later attention.
+            for sequence in coverage.sequences:
+                written = sequence.allocation.written[sequence.plane][layer]
+                for start, end in sequence.ranges:
+                    written.add_range(start, end)
 
     def _require_prefix(self, allocation, layer, depth, length):
         written = allocation.written[self._plane(depth)][layer]
@@ -728,10 +1102,10 @@ class KVCacheManager:
 
     @torch.no_grad()
     def _attend_prepared(
-        self, layer: int, batch: KVMetadata | DeviceKVMetadata, q: torch.Tensor
+        self, layer: int, batch: KVMetadata | DeviceKVMetadata, q: torch.Tensor, *, _stream=None
     ) -> torch.Tensor:
         self._validate_layer(layer)
-        self._require_live_batch(batch)
+        coverage = self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
         if isinstance(batch, DeviceKVMetadata):
             return self.attention(
@@ -743,8 +1117,23 @@ class KVCacheManager:
             )
         if not batch.rows:
             return torch.empty_like(q)
-        for allocation, depth, position in batch.rows:
-            self._require_prefix(allocation, layer, depth, position + 1)
+        if self._contiguous is not None:
+            pair = self._contiguous.get(layer, batch, stream=_stream)
+            if pair is not None:
+                # The authoritative append-only store proves an initialized
+                # prefix for every live row. Holes, overwrite, truncate and
+                # generic writes escape to the paged checks below.
+                return self.attention.kernel.attend_contiguous(q, pair, batch, stream=_stream)
+        if coverage is None:
+            for allocation, depth, position in batch.rows:
+                self._require_prefix(allocation, layer, depth, position + 1)
+        else:
+            for sequence in coverage.sequences:
+                self._require_prefix(
+                    sequence.allocation, layer, sequence.plane, sequence.ranges[-1][1]
+                )
+        if batch.deferred_addresses:
+            batch = self.metadata_builder.materialize_paged(batch)
         if batch.cu_seqlens_q is not None:
             return self.attention.prefill(
                 q,
@@ -755,6 +1144,10 @@ class KVCacheManager:
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
             )
+        if self._read_cache is not None and batch.sequence_ranges is not None:
+            pair = self._read_cache.get(layer, batch)
+            if pair is not None:
+                return self.attention.kernel.attend_contiguous(q, pair, batch)
         return self.attention.attend_metadata(
             q, self.key_cache[:, layer], self.value_cache[:, layer], batch
         )
@@ -771,6 +1164,8 @@ class KVCacheManager:
             allocation.block_tables[self._plane(depth)][logical_page]
             for depth in range(exit_depth + 1, self.max_loops)
         ]
+        if destinations:
+            self._invalidate_read_cache()
         # Basic-index copies avoid a blocking host->device index tensor on the
         # boundary stream. That transfer would serialize final core and routing.
         for destination in destinations:
@@ -786,6 +1181,33 @@ class KVCacheManager:
                         self.value_cache[source, layer, offset]
                     )
         self._record_finalized(allocation, position, exit_depth)
+
+    @cached_property
+    def key_cache(self):
+        self._materialize_paged()
+        return self._key_cache
+
+    @cached_property
+    def value_cache(self):
+        self._materialize_paged()
+        return self._value_cache
+
+    def _materialize_paged(self):
+        if self._key_cache is None:
+            key = torch.empty(self._paged_shape, device=self.device, dtype=self.dtype)
+            value = torch.empty_like(key)
+            self._key_cache, self._value_cache = key, value
+        if self._contiguous is not None:
+            self._contiguous.export(self._key_cache, self._value_cache, self.block_size)
+            self._contiguous = None
+        # Preserve direct Tensor attribute access for the default paged backends.
+        self.key_cache, self.value_cache = self._key_cache, self._value_cache
+
+    def _invalidate_read_cache(self, *, preserve_contiguous=False):
+        if not preserve_contiguous and self._contiguous is not None and self._contiguous.rows:
+            self._materialize_paged()
+        if self._read_cache is not None:
+            self._read_cache.clear()
 
     @torch.no_grad()
     def read(self, layer: int, request_id: str, depth: int, length: int | None = None):

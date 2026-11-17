@@ -21,6 +21,11 @@ def add_runtime_args(parser):
     parser.add_argument("--target-loops", type=int, default=4)
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--incremental-kv", action="store_true")
+    parser.add_argument(
+        "--contiguous-kv",
+        action="store_true",
+        help="Use owned eager KV cohorts (Ascend private reserved cache)",
+    )
     parser.add_argument("--kv-watermark", type=float, default=0.0)
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
     parser.add_argument("--enable-preemption", action="store_true")
@@ -49,6 +54,11 @@ def add_runtime_args(parser):
     parser.add_argument("--lookahead-seed", type=int, default=0)
     parser.add_argument("--async-scheduling", action="store_true")
     parser.add_argument(
+        "--coalesce-fixed-prelude",
+        action="store_true",
+        help="Run fixed full-depth decode prelude and loops together (NPU eager)",
+    )
+    parser.add_argument(
         "--cuda-graphs",
         action="store_true",
         help="Capture decode/wavefront recurrent cores and speculative coda; sampling stays eager",
@@ -70,6 +80,11 @@ def add_runtime_args(parser):
         "--single-stream",
         action="store_true",
         help="Disable multi-stream CUDA execution independently of async scheduling",
+    )
+    parser.add_argument(
+        "--native-eager-plan",
+        action="store_true",
+        help="Dispatch unchanged Ouro eager operations from a native host plan (NPU)",
     )
     parser.add_argument("--static-buffers", action="store_true")
     parser.add_argument("--pad-to-power-of-two", action="store_true")
@@ -102,6 +117,7 @@ def runtime_configs(args):
         cache_config=CacheConfig(
             enable_prefix_caching=args.enable_prefix_caching,
             incremental_allocation=args.incremental_kv,
+            contiguous_kv=args.contiguous_kv,
             watermark_ratio=args.kv_watermark,
             num_blocks=args.num_blocks,
             block_size=args.block_size,
@@ -125,6 +141,8 @@ def runtime_configs(args):
             cuda_graph_max_graphs=args.cuda_graph_max_graphs,
             cuda_graph_memory_reserve_bytes=args.cuda_graph_memory_reserve_bytes,
             async_scheduling=args.async_scheduling,
+            coalesce_fixed_prelude=args.coalesce_fixed_prelude,
+            native_eager_plan=args.native_eager_plan,
             multi_stream=not args.single_stream,
             static_buffers=args.static_buffers,
             pad_to_power_of_two=args.pad_to_power_of_two,

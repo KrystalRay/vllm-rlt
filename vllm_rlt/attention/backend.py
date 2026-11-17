@@ -23,6 +23,9 @@ class BackendCapabilities:
     packed_matches_decode: bool = False
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
+    sequence_ranges: bool = False
+    # Consume private, owned KV pairs in [batch, kv_head, token, head_dim] layout.
+    owned_contiguous_kv: bool = False
 
 
 @dataclass
@@ -57,6 +60,9 @@ class AttentionBackend:
 
 
 _TORCH_CAPABILITIES = BackendCapabilities()
+_ASCEND_CAPABILITIES = BackendCapabilities(
+    async_scheduling=True, sequence_ranges=True, owned_contiguous_kv=True
+)
 _TRITON_CAPABILITIES = BackendCapabilities(
     cuda_graphs=True, async_scheduling=True, device_context_lengths=True
 )
@@ -89,7 +95,7 @@ def _create_explicit(backend, device, dtype, head_dim, block_size):
             raise ValueError("ascend_eager requires an NPU and BF16")
         from vllm_rlt.kernels.ascend_eager import AscendEagerAttention
 
-        return AttentionBackend(AscendEagerAttention(), _TORCH_CAPABILITIES, {"backend": backend})
+        return AttentionBackend(AscendEagerAttention(), _ASCEND_CAPABILITIES, {"backend": backend})
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
@@ -145,6 +151,8 @@ def create_backend(
                     "cuda_graphs",
                     "async_scheduling",
                     "device_context_lengths",
+                    "sequence_ranges",
+                    "owned_contiguous_kv",
                 )
                 if getattr(required_capabilities, name)
                 and not getattr(implementation.capabilities, name)

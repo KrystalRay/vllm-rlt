@@ -142,6 +142,12 @@ class ModelRuntime:
     def __init__(self, model, cache):
         self.model = model
         self.cache = cache
+        self.layer_executor = None
+
+    def enable_native_eager(self):
+        from vllm_rlt.worker.native_ouro import NativeOuroExecutor
+
+        self.layer_executor = NativeOuroExecutor()
 
     def prepare(self, batch: ForwardBatch) -> ForwardBatch:
         """Choose graph/fallback for every call before execution.
@@ -200,6 +206,12 @@ class ModelRuntime:
                 raise ValueError(f"unsupported operation {batch.operation}")
             if hidden is None:
                 raise ValueError("RECURRENT requires hidden state")
+            position_key = position_embeddings = None
+            reuse_positions = (
+                batch.graphs is None
+                and hidden.device.type == "npu"
+                and getattr(self.model, "reuse_position_embeddings", False)
+            )
             for index, kv in enumerate(batch.metadata):
                 if batch.graphs is not None:
                     call = batch.graph_calls[index]
@@ -207,8 +219,27 @@ class ModelRuntime:
                         batch.graphs.prepare_inputs(call, hidden)
                     hidden, gate = batch.graphs.execute(call, hidden)
                 else:
+                    options = (
+                        {"layer_executor": self.layer_executor}
+                        if self.layer_executor is not None
+                        else {}
+                    )
+                    if reuse_positions:
+                        positions = kv.position_ids
+                        key = (
+                            positions.data_ptr(),
+                            positions.shape,
+                            positions.stride(),
+                            positions.dtype,
+                            positions.device,
+                            hidden.dtype,
+                        )
+                        if key != position_key:
+                            position_embeddings = self.model.model.rotary_emb(hidden, positions)
+                            position_key = key
+                        options["position_embeddings"] = position_embeddings
                     hidden, gate = self.model.recurrent_prepared(
-                        hidden, kv, self.cache, compute_gate=batch.compute_gate
+                        hidden, kv, self.cache, compute_gate=batch.compute_gate, **options
                     )
             return ForwardResult(hidden, gate)
         finally:

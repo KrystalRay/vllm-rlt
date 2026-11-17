@@ -214,7 +214,13 @@ class OuroDecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         batch: "KVMetadata | DeviceKVMetadata",
         cache: "KVCacheManager",
+        *,
+        layer_executor=None,
     ) -> torch.Tensor:
+        if layer_executor is not None:
+            output = layer_executor.layer(self, hidden, position_embeddings, batch, cache)
+            if output is not None:
+                return output
         attention = self.self_attn(self.input_layernorm(hidden), position_embeddings, batch, cache)
         hidden = hidden + self.input_layernorm_2(attention)
         return hidden + self.post_attention_layernorm_2(
@@ -236,6 +242,11 @@ class OuroModel(nn.Module):
 
 class OuroForCausalLM(nn.Module):
     """Inference-only native Ouro-1.4B with checkpoint-compatible parameter names."""
+
+    # Eager prelude/recurrent outputs own their allocation, and subsequent
+    # calls do not mutate it. Graph/static-buffer executors must not borrow it.
+    immutable_hidden_outputs = True
+    reuse_position_embeddings = True
 
     def __init__(self, config: OuroConfig) -> None:
         super().__init__()
@@ -281,15 +292,34 @@ class OuroForCausalLM(nn.Module):
         batch = cache._prepare_batch(request_ids, depths, positions)
         return self.recurrent_prepared(hidden, batch, cache, compute_gate=compute_gate)
 
-    def recurrent_prepared(self, hidden, batch, cache, *, compute_gate=True):
+    def recurrent_prepared(
+        self,
+        hidden,
+        batch,
+        cache,
+        *,
+        compute_gate=True,
+        position_embeddings=None,
+        layer_executor=None,
+    ):
         """Run core with runner-owned metadata, including inactive padding rows."""
-        position_embeddings = self.model.rotary_emb(hidden, batch.position_ids)
+        if position_embeddings is None:
+            position_embeddings = self.model.rotary_emb(hidden, batch.position_ids)
+        traversal = cache._begin_traversal(batch)
         for layer in self.model.layers:
-            hidden = layer(hidden, position_embeddings, batch, cache)
+            if layer_executor is None:
+                hidden = layer(hidden, position_embeddings, batch, traversal)
+            else:
+                hidden = layer(
+                    hidden, position_embeddings, batch, traversal, layer_executor=layer_executor
+                )
         # Norm is inside the recurrence in Ouro; this normalized state is the
         # next loop's input as well as the gate and LM head input.
         hidden = self.model.norm(hidden)
-        return hidden, self.model.early_exit_gate(hidden).squeeze(-1) if compute_gate else None
+        gate = self.model.early_exit_gate(hidden).squeeze(-1) if compute_gate else None
+        if traversal is not cache:
+            traversal.finish()
+        return hidden, gate
 
     def coda(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

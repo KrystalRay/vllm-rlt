@@ -67,8 +67,9 @@ They do not establish model quality or performance; use the
 [accuracy guide](../accuracy.md) and [serving benchmark guide](../serving.md)
 for those evaluations.
 
-Async scheduling, graphs, speculation, PD, preemption, prefix caching and
-adaptive exit are currently unsupported on this path.
+Steps 1–4 describe synchronous execution. For the qualified fixed-depth async
+configuration, see section 6. Graphs, speculation, PD, preemption, prefix caching
+and adaptive exit are outside that configuration.
 
 ## 5. Attention batching and device-side KV writes
 
@@ -207,3 +208,122 @@ not qualify this change.
 - Only the full-prefill synchronous path is qualified. Async scheduling,
   graphs, speculation, PD, preemption, prefix caching and adaptive exit
   remain unsupported here.
+
+
+## 6. Owned KV and fixed-depth asynchronous execution
+
+This section describes the November 17 engine-only follow-up. Sections above retain
+historical configurations and measurements. This path keeps separate Q/K/V and
+MLP projections, explicit RMSNorm and RoPE arithmetic, and eager matmul/softmax
+attention. It uses neither NPU Graph replay nor fused/replacement model operators.
+
+The optimized execution plan combines prelude and all four fixed decode depths,
+reuses immutable whole-batch GPU token inputs, and retains compact uniform range and
+allocation plans across tokens. Attention consumes owned contiguous KV directly.
+Layer-prefix proofs advance once per cohort; individual mutations detach their
+records. The layer-complete proof means all writes were **enqueued**; cross-stream
+reads, result delivery and release still depend on completion events. Generic cache
+access exports live histories to paged storage, and can briefly double KV storage.
+
+The Python switches are `CacheConfig(contiguous_kv=True)` and
+`ExecutionConfig(async_scheduling=True, multi_stream=False, use_uva=False,
+coalesce_fixed_prelude=True, native_eager_plan=True)`, with `attention_backend="ascend_eager"` and
+`ExitConfig("ouro_delayed")`. Set `SamplingParams(min_loops=4, max_loops=4,
+exit_threshold=1.0, temperature=0.0)`. Graphs, static inputs, padding, prefix sharing,
+incremental allocation, adaptive depth, speculation, PD and preemption are outside
+this measured combination. Small NPU tests additionally cover multiple streams;
+all reported throughput uses one stream.
+
+The optional `native_eager_plan` is a host execution plan, implemented in
+`worker/native_ouro.py` and `worker/csrc/ascend_eager_plan.cpp`. It issues the same
+individual ATen operations through Torch-NPU while releasing the Python GIL. It
+retains separate Q/K/V and gate/up linear calls, explicit norm/RoPE operations and
+attention matmuls. It does not compile or replay a device graph. Every call receives
+live module weights and returns owned output/KV tensors. Unsupported module types,
+child hooks, custom child forwards and paged fallback retain the Python path;
+ordinary decoder-layer hooks still run. Changes to the Python layer arithmetic
+must update and revalidate this optional executor as well.
+
+The first enabled startup needs a C++17 compiler, Ninja, PyTorch headers and a
+writable binary cache. Compilation occurs before request timing (about 34 seconds
+in this environment). `VLLM_RLT_NATIVE_BUILD_DIR` changes the cache root and
+`MAX_JOBS=1` limits build parallelism. The digest includes source, Torch version,
+C++ ABI and Python SOABI. Leave the flag disabled to use the optimized Python
+engine without requiring a compiler. Default CPU/CUDA execution does not import
+or build this extension; CUDA hardware was not qualified in this campaign.
+
+All final arms, including HF, set `TASK_QUEUE_ENABLE=2` before importing
+Torch-NPU. Queue tuning also improves HF and is not counted as an engine-relative
+gain. Each arm uses the same CPU affinity, one NPU and one execution stream for a
+case. Model load, extension compilation and a complete shape-matched warmup cohort
+are excluded from the steady-state measurement.
+
+| Case | Prompt / output | Client concurrency | Resident batch | Token budget | Prefill chunk | Reserved blocks |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| S8 | 128 / 32 | 8 | 8 | 1024 | 1024 | 336 |
+| S64 | 128 / 32 | 64 | 64 | 8192 | 1024 | 2576 |
+| L8 | 4096 / 32 | 8 | 4 | 16384 | 4096 | 4144 |
+
+All blocks contain 16 tokens. These cases use complete, equal-length prefill and
+ignore EOS for timing. Natural-text correctness checks use normal EOS separately.
+This is not W1–W7 qualification, a saturation sweep, or validation of arbitrary
+chunked/mixed-length prefill. Smaller long-prompt chunks are a separate numerical
+and performance experiment and must not be mixed into these results.
+
+A real-checkpoint CLI smoke/startup command is:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 TASK_QUEUE_ENABLE=2 OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli \
+  --model /work/models/Ouro-1.4B --device npu --dtype bfloat16 \
+  --attention-backend ascend_eager --prompt "Explain why the sky is blue." \
+  --max-tokens 4 --min-loops 4 --max-loops 4 --exit-mode ouro_delayed \
+  --async-scheduling --single-stream --no-uva --contiguous-kv \
+  --coalesce-fixed-prelude --native-eager-plan --num-blocks 256 \
+  --prefill-chunk-size 4096 --max-num-batched-tokens 4096
+```
+
+The experiment bundle on `ssh npu`, inside `kelei-rlt`, is
+`/work/vllm-rlt-engine-20261117`. It contains the immutable protocol token IDs,
+pinned official HF source, runtime SHA manifests, unprofiled per-request records,
+matched ops-only/full traces, and reproduction entry points. Timed runs use the
+unchanged official eager model plus a public predeclared `DynamicCache` to support
+Transformers 4.54.1's cache API. Every emitted token still executes four UT depths.
+The CPU FP32 RoPE-constant correction is an explicit numerical fix, not a scheduling
+speedup: the old NPU-generated constants did not match HF.
+
+| Case | HF eager tok/s | Python plan tok/s | Native host plan tok/s | Native vs HF |
+| --- | ---: | ---: | ---: | ---: |
+| S8 | 52.288 | 53.747 | 83.057 | +58.85% |
+| S64 | 360.503 | 350.864 | 503.256 | +39.60% |
+| L8 | 14.119 | 14.209 | 17.032 | +20.63% |
+
+These are medians of three independent unprofiled runs. For every case, native
+exceeded HF in each same-round comparison. All 27 arm/case/repeat runs completed
+with zero failed requests. The Python plan arm shares the runtime, cache path,
+asynchronous scheduling and environment with native; only `native_eager_plan`
+differs. Its near-HF result shows that the large additional gain comes from host
+ATen dispatch, rather than from enabling asynchronous scheduling alone.
+
+The fixed quality set passes 192/192 complete 32-token sequences. All 3,538 native
+requests in the formal timing windows (113,216 output tokens) also exactly match
+the pinned HF oracle. Sixteen untruncated natural prompts match token IDs and
+normal-EOS finish reasons. CPU regression: 979 passed; final targeted NPU suite:
+60 passed, including native multi-stream cancellation/ID reuse/owned-output checks.
+The actual checkpoint CLI startup command above completed four UT4 output tokens.
+
+Matched S64 decode profiles contain 4 UT calls / 96 decoder layers. Python and
+native both issue 6,416 device tasks, and both match HF's principal ATen counts:
+677 linear, 388 each pow/mean/rsqrt, 96 softmax and 96 SiLU. Module dispatch calls
+fall from 1,358 to 110. Total Python call count is not lower because native performs
+conservative module/hook guards; per-operator Python wrapping and module dispatch
+are removed from the model path. Device task counts include copies and layout/
+metadata work; the HF total is 6,521. ops-only/full captures are for attribution,
+not benchmark rates. Full captures have shapes, stacks and memory exports; the
+profiler warns of incomplete memory records, so memory conclusions use unprofiled
+peak allocation rather than an asserted leak-free trace.
+
+The experiment directory retains `final-results`, `final-summary.json`,
+`native-fixed-quality.json`, `natural-quality-native.json`, source manifests,
+`nativeplan-final-npu-tests.log`, complete profiles and local reproduction scripts.
+No CUDA hardware run, adaptive-exit qualification, arbitrary chunked-prefill
+qualification, HTTP/network latency or saturation search is implied by these data.

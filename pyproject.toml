@@ -37,6 +37,9 @@ vllm-rlt-pd-serve = "vllm_rlt.entrypoints.pd_serve:main"
 [tool.setuptools.packages.find]
 include = ["vllm_rlt*"]
 
+[tool.setuptools.package-data]
+"vllm_rlt.models" = ["csrc/ouro_layer.cpp"]
+
 [tool.setuptools]
 license-files = ["LICENSE", "NOTICE"]
 

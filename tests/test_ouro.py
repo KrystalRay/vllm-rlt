@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import textwrap
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -13,12 +14,36 @@ from tests.helpers import make_cpu_cache, tiny_ouro_config
 from tests.reference import dense_reference
 from vllm_rlt.models import OuroConfig, OuroForCausalLM
 from vllm_rlt.models.ouro import OuroMLP
+from vllm_rlt.models.ouro_dispatch import _dispatch_layer
 
 
 @pytest.fixture
 def model():
     torch.manual_seed(71)
     return OuroForCausalLM(tiny_ouro_config())
+
+
+@torch.inference_mode()
+def test_cpp_dispatch_reads_replaced_weights_and_preserves_child_hooks(model):
+    layer = model.model.layers[0]
+    cache = make_cpu_cache(model.config)
+    assert cache.allocate("prompt", 1)
+    batch = cache._prepare_batch(["prompt"], [0], [0])
+    hidden = model.prelude(torch.tensor([5]))
+    rope = model.model.rotary_emb(hidden, batch.position_ids)
+    native = Mock(return_value=hidden)
+
+    projection = layer.self_attn.q_proj
+    projection.weight = torch.nn.Parameter(torch.zeros_like(projection.weight), requires_grad=False)
+    assert _dispatch_layer(native, layer, hidden, rope, batch, cache) is hidden
+    assert native.call_args.args[5][0] is projection.weight
+    native.reset_mock()
+
+    hook = Mock(return_value=None)
+    with projection.register_forward_hook(hook):
+        _dispatch_layer(native, layer, hidden, rope, batch, cache)
+    hook.assert_called_once()
+    native.assert_not_called()
 
 
 @pytest.mark.gpu

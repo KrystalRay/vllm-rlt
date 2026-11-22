@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
+from torch.nn.modules import module as nn_module
 
 from vllm_rlt.device import resolve_device
 from vllm_rlt.kernels import silu_and_mul
@@ -281,11 +282,23 @@ class OuroForCausalLM(nn.Module):
         batch = cache._prepare_batch(request_ids, depths, positions)
         return self.recurrent_prepared(hidden, batch, cache, compute_gate=compute_gate)
 
-    def recurrent_prepared(self, hidden, batch, cache, *, compute_gate=True):
+    def recurrent_prepared(self, hidden, batch, cache, *, compute_gate=True, _layer_dispatch=None):
         """Run core with runner-owned metadata, including inactive padding rows."""
         position_embeddings = self.model.rotary_emb(hidden, batch.position_ids)
+        if _layer_dispatch is not None and (
+            self.training
+            or type(hidden) is not torch.Tensor
+            or not torch.is_inference_mode_enabled()
+            or torch.is_autocast_enabled(hidden.device.type)
+            or nn_module._global_forward_pre_hooks
+            or nn_module._global_forward_hooks
+        ):
+            _layer_dispatch = None
         for layer in self.model.layers:
-            hidden = layer(hidden, position_embeddings, batch, cache)
+            if _layer_dispatch is None:
+                hidden = layer(hidden, position_embeddings, batch, cache)
+            else:
+                hidden = _layer_dispatch(layer, hidden, position_embeddings, batch, cache)
         # Norm is inside the recurrence in Ouro; this normalized state is the
         # next loop's input as well as the gate and LM head input.
         hidden = self.model.norm(hidden)

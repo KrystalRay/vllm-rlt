@@ -4,6 +4,7 @@ Executor routes scheduled batches to their runner. ModelRuntime executes prepare
 model calls for ordinary and speculative runners; it never updates Request progress.
 """
 
+import os
 from collections.abc import Generator, Iterable
 from dataclasses import dataclass, replace
 
@@ -142,6 +143,14 @@ class ModelRuntime:
     def __init__(self, model, cache):
         self.model = model
         self.cache = cache
+        self._ouro_layer_dispatch = None
+        if os.environ.get("VLLM_RLT_OURO_CPP_DISPATCH") == "1":
+            from vllm_rlt.models.ouro import OuroForCausalLM
+
+            if type(model) is OuroForCausalLM and next(model.parameters()).device.type == "npu":
+                from vllm_rlt.models.ouro_dispatch import load_ouro_layer_dispatch
+
+                self._ouro_layer_dispatch = load_ouro_layer_dispatch()
 
     def prepare(self, batch: ForwardBatch) -> ForwardBatch:
         """Choose graph/fallback for every call before execution.
@@ -215,6 +224,16 @@ class ModelRuntime:
                     if not call.inputs_ready:
                         batch.graphs.prepare_inputs(call, hidden)
                     hidden, gate = batch.graphs.execute(call, hidden)
+                elif self._ouro_layer_dispatch is not None and (
+                    "recurrent_prepared" not in vars(self.model)
+                ):
+                    hidden, gate = self.model.recurrent_prepared(
+                        hidden,
+                        kv,
+                        self.cache,
+                        compute_gate=batch.compute_gate,
+                        _layer_dispatch=self._ouro_layer_dispatch,
+                    )
                 else:
                     hidden, gate = self.model.recurrent_prepared(
                         hidden, kv, self.cache, compute_gate=batch.compute_gate

@@ -78,6 +78,12 @@ python -m vllm_rlt.entrypoints.serve \
 
 For synchronous eager execution, omit `--async-scheduling`.
 
+Set `VLLM_RLT_OURO_CPP_DISPATCH=1` on the serving process to enable optional
+C++ dispatch for standard Ouro decoder layers. PyTorch builds the host extension
+on first use, which requires a C++ compiler and Ninja. The extension submits the
+same ATen operations and calls the existing prepared KV write and attention
+methods. Both synchronous and asynchronous execution use their existing schedules.
+
 Wait for `/health` to return HTTP 200, then send a completion. Add
 `"stream": true` for server-sent events.
 

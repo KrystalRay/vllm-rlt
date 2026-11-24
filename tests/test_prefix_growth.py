@@ -2,9 +2,12 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from tests.test_ascend import make_npu_model
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.device import resolve_device
 from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import RequestPhase
 
@@ -64,6 +67,52 @@ def test_prefix_refcounts_and_eviction():
     assert not c.lookup_prefix([1, 2, 3, 4, 5])
     c.free("all")
     assert c.num_free_blocks == 12
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "asynchronous,multi_stream,wavefront",
+    [(False, False, False), (True, False, True), (True, True, True)],
+    ids=["sync", "async-wavefront-single", "async-wavefront-multi"],
+)
+@torch.inference_mode()
+def test_npu_incremental_growth_matches_reserved_generation(asynchronous, multi_stream, wavefront):
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    prompts = {"a": [3, 7, 11] * 5, "b": [13, 17, 19] * 6}
+    params = SamplingParams(max_tokens=4, min_loops=2, exit_threshold=0.2, ignore_eos=True)
+    results = []
+    for incremental in (False, True):
+        engine = StageEngine(
+            model,
+            attention_backend="ascend_eager",
+            cache_config=CacheConfig(96, 16, incremental_allocation=incremental),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=48,
+                prefill_chunk_size=16,
+                wavefront_chunked_prefill=wavefront,
+            ),
+            exit_config=ExitConfig("ouro_delayed"),
+            execution_config=ExecutionConfig(
+                async_scheduling=asynchronous, multi_stream=multi_stream, use_uva=False
+            ),
+        )
+        try:
+            for request_id, prompt in prompts.items():
+                engine.add_request(request_id, prompt, params)
+            engine.step()
+            cache = engine.cache_manager
+            assert cache.allocated_blocks("a") == (4 if incremental else 8)
+            outputs = finish(engine)
+            assert outputs.keys() == prompts.keys()
+            assert all(len(out.token_ids) == params.max_tokens for out in outputs.values())
+            results.append({key: (out.token_ids, out.exit_depths) for key, out in outputs.items()})
+            assert cache.num_used_blocks == 0
+        finally:
+            engine.close()
+    assert results[0] == results[1]
 
 
 def test_incremental_growth_matches_reserved_generation():
